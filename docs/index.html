@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NSE Momentum — Paper Trading Tracker</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0f1117; --card: #1a1d27; --border: #2a2e3a;
+    --text: #e6e8ef; --muted: #9298ab; --green: #3ecf8e; --red: #f0616d;
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    margin: 0; padding: 24px; max-width: 1100px; margin-inline: auto;
+  }
+  h1 { font-size: 1.4rem; margin-bottom: 4px; }
+  .subtitle { color: var(--muted); font-size: 0.9rem; margin-bottom: 24px; }
+  .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 28px; }
+  .metric-card {
+    background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 16px;
+  }
+  .metric-label { color: var(--muted); font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.03em; }
+  .metric-value { font-size: 1.5rem; font-weight: 600; margin-top: 4px; }
+  .metric-delta { font-size: 0.85rem; margin-top: 4px; }
+  .up { color: var(--green); } .down { color: var(--red); }
+  section { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 20px; margin-bottom: 20px; }
+  section h2 { font-size: 1rem; margin: 0 0 14px 0; color: var(--text); }
+  table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 500; }
+  .empty { color: var(--muted); font-style: italic; padding: 20px 0; text-align: center; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 5px; font-size: 0.75rem; }
+  .badge.BUY { background: rgba(62,207,142,0.15); color: var(--green); }
+  .badge.SELL { background: rgba(240,97,109,0.15); color: var(--red); }
+  .badge.RESIZE { background: rgba(146,152,171,0.15); color: var(--muted); }
+  .footer { color: var(--muted); font-size: 0.8rem; text-align: center; margin-top: 30px; }
+  canvas { max-height: 320px; }
+</style>
+</head>
+<body>
+  <h1>NSE Momentum — Paper Trading Tracker</h1>
+  <div class="subtitle">Forward paper-trading record for the Clenow-style momentum strategy. No real orders are placed — simulated fills only.</div>
+
+  <div class="metrics" id="metrics"></div>
+
+  <section>
+    <h2>Equity curve</h2>
+    <canvas id="equityChart"></canvas>
+  </section>
+
+  <section>
+    <h2>Current holdings</h2>
+    <div id="holdings"></div>
+  </section>
+
+  <section>
+    <h2>Trade log</h2>
+    <div id="tradelog"></div>
+  </section>
+
+  <div class="footer">Data refreshes when paper_trade.py --push runs (weekly cadence). Read-only — cannot place trades.</div>
+
+<script>
+function parseCSV(text) {
+  const lines = text.trim().split("\n");
+  if (lines.length < 2) return [];
+  const headers = lines[0].split(",");
+  return lines.slice(1).map(line => {
+    const cells = line.split(",");
+    const row = {};
+    headers.forEach((h, i) => row[h.trim()] = cells[i] !== undefined ? cells[i].trim() : "");
+    return row;
+  });
+}
+
+function fmtRs(n) {
+  return "Rs." + Number(n).toLocaleString("en-IN", { maximumFractionDigits: 0 });
+}
+
+function renderMetrics(state, equityHistory) {
+  const el = document.getElementById("metrics");
+  const currentValue = equityHistory.length
+    ? Number(equityHistory[equityHistory.length - 1].equity)
+    : Number(state.cash);
+  const initialValue = equityHistory.length ? Number(equityHistory[0].equity) : Number(state.cash);
+  const pctReturn = initialValue ? ((currentValue / initialValue - 1) * 100) : 0;
+  const deltaClass = pctReturn >= 0 ? "up" : "down";
+  const nPositions = Object.keys(state.positions || {}).length;
+
+  el.innerHTML = `
+    <div class="metric-card">
+      <div class="metric-label">Portfolio Value</div>
+      <div class="metric-value">${fmtRs(currentValue)}</div>
+      <div class="metric-delta ${deltaClass}">${pctReturn >= 0 ? "+" : ""}${pctReturn.toFixed(2)}% since start</div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-label">Cash</div>
+      <div class="metric-value">${fmtRs(state.cash)}</div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-label">Open Positions</div>
+      <div class="metric-value">${nPositions}</div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-label">Last Run</div>
+      <div class="metric-value" style="font-size:1.1rem">${state.last_run || "—"}</div>
+    </div>
+  `;
+}
+
+function renderEquityChart(equityHistory) {
+  const ctx = document.getElementById("equityChart");
+  if (!equityHistory.length) {
+    ctx.replaceWith(Object.assign(document.createElement("div"), {
+      className: "empty", textContent: "No equity history yet — accumulates one point per weekly run."
+    }));
+    return;
+  }
+  new Chart(ctx, {
+    type: "line",
+    data: {
+      labels: equityHistory.map(r => r.date),
+      datasets: [{
+        label: "Portfolio Value (Rs.)",
+        data: equityHistory.map(r => Number(r.equity)),
+        borderColor: "#3ecf8e",
+        backgroundColor: "rgba(62,207,142,0.08)",
+        fill: true, tension: 0.2, pointRadius: 2,
+      }]
+    },
+    options: {
+      responsive: true,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { ticks: { color: "#9298ab" }, grid: { color: "#2a2e3a" } },
+        y: { ticks: { color: "#9298ab" }, grid: { color: "#2a2e3a" } },
+      }
+    }
+  });
+}
+
+function renderHoldings(state) {
+  const el = document.getElementById("holdings");
+  const positions = state.positions || {};
+  const tickers = Object.keys(positions);
+  if (!tickers.length) {
+    el.innerHTML = '<div class="empty">No open positions.</div>';
+    return;
+  }
+  const rows = tickers
+    .map(t => ({ t, ...positions[t], cost: positions[t].shares * positions[t].entry_price }))
+    .sort((a, b) => b.cost - a.cost);
+  el.innerHTML = `
+    <table>
+      <thead><tr><th>Ticker</th><th>Shares</th><th>Entry Price</th><th>Cost Basis</th></tr></thead>
+      <tbody>
+        ${rows.map(r => `<tr><td>${r.t}</td><td>${Number(r.shares).toFixed(2)}</td><td>${fmtRs(r.entry_price)}</td><td>${fmtRs(r.cost)}</td></tr>`).join("")}
+      </tbody>
+    </table>`;
+}
+
+function renderTradeLog(trades) {
+  const el = document.getElementById("tradelog");
+  if (!trades.length) {
+    el.innerHTML = '<div class="empty">No trades logged yet.</div>';
+    return;
+  }
+  const sorted = [...trades].sort((a, b) => (a.date < b.date ? 1 : -1));
+  el.innerHTML = `
+    <table>
+      <thead><tr><th>Date</th><th>Action</th><th>Ticker</th><th>Price</th><th>Reason</th></tr></thead>
+      <tbody>
+        ${sorted.map(r => `
+          <tr>
+            <td>${r.date}</td>
+            <td><span class="badge ${r.action}">${r.action}</span></td>
+            <td>${r.ticker || ""}</td>
+            <td>${r.price ? fmtRs(r.price) : ""}</td>
+            <td>${r.reason || ""}</td>
+          </tr>`).join("")}
+      </tbody>
+    </table>`;
+}
+
+async function loadDashboard() {
+  try {
+    const stateResp = await fetch("paper_state.json", { cache: "no-store" });
+    if (!stateResp.ok) throw new Error("no state file");
+    const state = await stateResp.json();
+
+    let equityHistory = [];
+    try {
+      const eqResp = await fetch("paper_equity_history.csv", { cache: "no-store" });
+      if (eqResp.ok) equityHistory = parseCSV(await eqResp.text());
+    } catch (e) { /* optional */ }
+
+    let trades = [];
+    try {
+      const logResp = await fetch("paper_trades_log.csv", { cache: "no-store" });
+      if (logResp.ok) trades = parseCSV(await logResp.text());
+    } catch (e) { /* optional */ }
+
+    renderMetrics(state, equityHistory);
+    renderEquityChart(equityHistory);
+    renderHoldings(state);
+    renderTradeLog(trades);
+  } catch (err) {
+    document.getElementById("metrics").innerHTML =
+      `<div class="empty">No paper_state.json found yet. Run <code>python paper_trade.py --init</code> locally, then <code>python paper_trade.py --push</code> to publish data here.</div>`;
+  }
+}
+
+loadDashboard();
+</script>
+</body>
+</html>
