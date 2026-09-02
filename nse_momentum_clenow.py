@@ -111,23 +111,42 @@ class Config:
 # Data
 # --------------------------------------------------------------------------
 
+EARLIEST_DATE = "2010-01-01"
+CACHE_MAX_AGE_HOURS = 20  # refetch full history if cache is older than this
+
+
 def download_data(cfg: Config, cache_dir: Path) -> dict[str, pd.DataFrame]:
     """Download OHLC data for the universe + benchmark via yfinance, with a
-    local parquet cache so repeat runs don't re-hit the network."""
+    local parquet cache so repeat runs don't re-hit the network.
+
+    IMPORTANT: the cache always stores each ticker's FULL history
+    (EARLIEST_DATE -> today), regardless of what --start/--end was passed.
+    Every call then slices that full history down to cfg.start/cfg.end
+    in-memory. This is what makes the cache safe to reuse across runs with
+    different date ranges -- a previous bug cached whatever the first run's
+    date range happened to be, so a later run with a different --start/--end
+    silently got the wrong window back."""
     import yfinance as yf
+    from datetime import datetime, timedelta
 
     cache_dir.mkdir(parents=True, exist_ok=True)
     data: dict[str, pd.DataFrame] = {}
     tickers = [cfg.benchmark] + [f"{t}.NS" for t in cfg.universe]
+    today = datetime.now().strftime("%Y-%m-%d")
+    stale_cutoff = datetime.now() - timedelta(hours=CACHE_MAX_AGE_HOURS)
 
     for ticker in tickers:
         cache_file = cache_dir / f"{ticker.replace('^', 'IDX_')}.parquet"
+        df = None
         if cache_file.exists():
-            df = pd.read_parquet(cache_file)
-        else:
+            mtime = datetime.fromtimestamp(cache_file.stat().st_mtime)
+            if mtime >= stale_cutoff:
+                df = pd.read_parquet(cache_file)
+
+        if df is None:
             try:
                 df = yf.download(
-                    ticker, start=cfg.start, end=cfg.end,
+                    ticker, start=EARLIEST_DATE, end=today,
                     auto_adjust=True, progress=False,
                 )
             except Exception as exc:  # pragma: no cover - network dependent
@@ -139,10 +158,12 @@ def download_data(cfg: Config, cache_dir: Path) -> dict[str, pd.DataFrame]:
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
             df.to_parquet(cache_file)
-        if len(df) >= cfg.min_history:
-            data[ticker] = df
+
+        sliced = df.loc[cfg.start:cfg.end]
+        if len(sliced) >= cfg.min_history:
+            data[ticker] = sliced
         else:
-            log.info("Skipping %s: only %d bars", ticker, len(df))
+            log.info("Skipping %s: only %d bars in requested range", ticker, len(sliced))
     return data
 
 

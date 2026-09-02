@@ -38,6 +38,20 @@
   .badge.RESIZE { background: rgba(146,152,171,0.15); color: var(--muted); }
   .footer { color: var(--muted); font-size: 0.8rem; text-align: center; margin-top: 30px; }
   canvas { max-height: 320px; }
+  .hint { color: var(--muted); font-weight: 400; font-size: 0.78rem; }
+  .toggle-row { display: flex; gap: 8px; margin-bottom: 12px; }
+  .toggle-btn {
+    background: transparent; border: 1px solid var(--border); color: var(--muted);
+    padding: 5px 12px; border-radius: 6px; cursor: pointer; font-size: 0.82rem;
+  }
+  .toggle-btn.active { background: rgba(62,207,142,0.15); color: var(--green); border-color: var(--green); }
+  th[data-sort] { cursor: pointer; user-select: none; }
+  th[data-sort]:hover { color: var(--text); }
+  #tradeFilter {
+    width: 100%; max-width: 260px; padding: 7px 10px; margin-bottom: 12px;
+    background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+    color: var(--text); font-size: 0.85rem;
+  }
 </style>
 </head>
 <body>
@@ -48,16 +62,22 @@
 
   <section>
     <h2>Equity curve</h2>
+    <div class="toggle-row" id="chartToggle">
+      <button class="toggle-btn active" data-series="equity">Equity</button>
+      <button class="toggle-btn" data-series="cash">Cash</button>
+      <button class="toggle-btn" data-series="n_positions">Positions</button>
+    </div>
     <canvas id="equityChart"></canvas>
   </section>
 
   <section>
-    <h2>Current holdings</h2>
+    <h2>Current holdings <span class="hint">(click a column to sort)</span></h2>
     <div id="holdings"></div>
   </section>
 
   <section>
-    <h2>Trade log</h2>
+    <h2>Trade log <span class="hint">(click a column to sort)</span></h2>
+    <input id="tradeFilter" type="text" placeholder="Filter by ticker..." />
     <div id="tradelog"></div>
   </section>
 
@@ -111,34 +131,79 @@ function renderMetrics(state, equityHistory) {
   `;
 }
 
-function renderEquityChart(equityHistory) {
+let equityChartInstance = null;
+const seriesMeta = {
+  equity: { label: "Portfolio Value (Rs.)", color: "#3ecf8e" },
+  cash: { label: "Cash (Rs.)", color: "#5b8cff" },
+  n_positions: { label: "Open Positions", color: "#e6b34e" },
+};
+
+function renderEquityChart(equityHistory, seriesKey) {
   const ctx = document.getElementById("equityChart");
   if (!equityHistory.length) {
+    document.getElementById("chartToggle").style.display = "none";
     ctx.replaceWith(Object.assign(document.createElement("div"), {
       className: "empty", textContent: "No equity history yet — accumulates one point per weekly run."
     }));
     return;
   }
-  new Chart(ctx, {
+  const meta = seriesMeta[seriesKey];
+  if (equityChartInstance) equityChartInstance.destroy();
+  equityChartInstance = new Chart(ctx, {
     type: "line",
     data: {
       labels: equityHistory.map(r => r.date),
       datasets: [{
-        label: "Portfolio Value (Rs.)",
-        data: equityHistory.map(r => Number(r.equity)),
-        borderColor: "#3ecf8e",
-        backgroundColor: "rgba(62,207,142,0.08)",
+        label: meta.label,
+        data: equityHistory.map(r => Number(r[seriesKey])),
+        borderColor: meta.color,
+        backgroundColor: meta.color + "14",
         fill: true, tension: 0.2, pointRadius: 2,
       }]
     },
     options: {
       responsive: true,
-      plugins: { legend: { display: false } },
+      plugins: { legend: { display: false }, tooltip: { mode: "index", intersect: false } },
       scales: {
         x: { ticks: { color: "#9298ab" }, grid: { color: "#2a2e3a" } },
         y: { ticks: { color: "#9298ab" }, grid: { color: "#2a2e3a" } },
       }
     }
+  });
+}
+
+function setupChartToggle(equityHistory) {
+  const row = document.getElementById("chartToggle");
+  row.querySelectorAll(".toggle-btn").forEach(btn => {
+    btn.addEventListener("click", () => {
+      row.querySelectorAll(".toggle-btn").forEach(b => b.classList.remove("active"));
+      btn.classList.add("active");
+      renderEquityChart(equityHistory, btn.dataset.series);
+    });
+  });
+}
+
+function sortRows(rows, key, numeric, dir) {
+  return [...rows].sort((a, b) => {
+    let va = a[key], vb = b[key];
+    if (numeric) { va = Number(va); vb = Number(vb); }
+    if (va < vb) return dir === "asc" ? -1 : 1;
+    if (va > vb) return dir === "asc" ? 1 : -1;
+    return 0;
+  });
+}
+
+function attachSortHandlers(tableEl, rows, renderRowsFn) {
+  let sortState = { key: null, dir: "asc" };
+  tableEl.querySelectorAll("th[data-sort]").forEach(th => {
+    th.addEventListener("click", () => {
+      const key = th.dataset.sort;
+      const numeric = th.dataset.numeric === "1";
+      sortState.dir = (sortState.key === key && sortState.dir === "asc") ? "desc" : "asc";
+      sortState.key = key;
+      const sorted = sortRows(rows, key, numeric, sortState.dir);
+      renderRowsFn(sorted);
+    });
   });
 }
 
@@ -150,39 +215,76 @@ function renderHoldings(state) {
     el.innerHTML = '<div class="empty">No open positions.</div>';
     return;
   }
-  const rows = tickers
-    .map(t => ({ t, ...positions[t], cost: positions[t].shares * positions[t].entry_price }))
-    .sort((a, b) => b.cost - a.cost);
-  el.innerHTML = `
-    <table>
-      <thead><tr><th>Ticker</th><th>Shares</th><th>Entry Price</th><th>Cost Basis</th></tr></thead>
-      <tbody>
-        ${rows.map(r => `<tr><td>${r.t}</td><td>${Number(r.shares).toFixed(2)}</td><td>${fmtRs(r.entry_price)}</td><td>${fmtRs(r.cost)}</td></tr>`).join("")}
-      </tbody>
-    </table>`;
+  const rows = tickers.map(t => ({
+    Ticker: t, Shares: Number(positions[t].shares),
+    "Entry Price": Number(positions[t].entry_price),
+    "Cost Basis": positions[t].shares * positions[t].entry_price,
+  }));
+
+  const draw = (rowsToDraw) => {
+    el.innerHTML = `
+      <table id="holdingsTable">
+        <thead><tr>
+          <th data-sort="Ticker">Ticker</th>
+          <th data-sort="Shares" data-numeric="1">Shares</th>
+          <th data-sort="Entry Price" data-numeric="1">Entry Price</th>
+          <th data-sort="Cost Basis" data-numeric="1">Cost Basis</th>
+        </tr></thead>
+        <tbody>
+          ${rowsToDraw.map(r => `<tr><td>${r.Ticker}</td><td>${r.Shares.toFixed(2)}</td><td>${fmtRs(r["Entry Price"])}</td><td>${fmtRs(r["Cost Basis"])}</td></tr>`).join("")}
+        </tbody>
+      </table>`;
+    attachSortHandlers(document.getElementById("holdingsTable"), rowsToDraw, draw);
+  };
+  draw(sortRows(rows, "Cost Basis", true, "desc"));
 }
 
 function renderTradeLog(trades) {
   const el = document.getElementById("tradelog");
+  const filterInput = document.getElementById("tradeFilter");
   if (!trades.length) {
     el.innerHTML = '<div class="empty">No trades logged yet.</div>';
+    filterInput.style.display = "none";
     return;
   }
-  const sorted = [...trades].sort((a, b) => (a.date < b.date ? 1 : -1));
-  el.innerHTML = `
-    <table>
-      <thead><tr><th>Date</th><th>Action</th><th>Ticker</th><th>Price</th><th>Reason</th></tr></thead>
-      <tbody>
-        ${sorted.map(r => `
-          <tr>
-            <td>${r.date}</td>
-            <td><span class="badge ${r.action}">${r.action}</span></td>
-            <td>${r.ticker || ""}</td>
-            <td>${r.price ? fmtRs(r.price) : ""}</td>
-            <td>${r.reason || ""}</td>
-          </tr>`).join("")}
-      </tbody>
-    </table>`;
+
+  const draw = (rowsToDraw) => {
+    if (!rowsToDraw.length) {
+      el.innerHTML = '<div class="empty">No trades match that filter.</div>';
+      return;
+    }
+    el.innerHTML = `
+      <table id="tradeTable">
+        <thead><tr>
+          <th data-sort="date">Date</th>
+          <th data-sort="action">Action</th>
+          <th data-sort="ticker">Ticker</th>
+          <th data-sort="price" data-numeric="1">Price</th>
+          <th data-sort="reason">Reason</th>
+        </tr></thead>
+        <tbody>
+          ${rowsToDraw.map(r => `
+            <tr>
+              <td>${r.date}</td>
+              <td><span class="badge ${r.action}">${r.action}</span></td>
+              <td>${r.ticker || ""}</td>
+              <td>${r.price ? fmtRs(r.price) : ""}</td>
+              <td>${r.reason || ""}</td>
+            </tr>`).join("")}
+        </tbody>
+      </table>`;
+    attachSortHandlers(document.getElementById("tradeTable"), rowsToDraw, draw);
+  };
+
+  const initial = sortRows(trades, "date", false, "desc");
+  draw(initial);
+
+  filterInput.style.display = "block";
+  filterInput.oninput = () => {
+    const q = filterInput.value.trim().toUpperCase();
+    const filtered = q ? trades.filter(r => (r.ticker || "").toUpperCase().includes(q)) : trades;
+    draw(sortRows(filtered, "date", false, "desc"));
+  };
 }
 
 async function loadDashboard() {
@@ -204,7 +306,8 @@ async function loadDashboard() {
     } catch (e) { /* optional */ }
 
     renderMetrics(state, equityHistory);
-    renderEquityChart(equityHistory);
+    renderEquityChart(equityHistory, "equity");
+    if (equityHistory.length) setupChartToggle(equityHistory);
     renderHoldings(state);
     renderTradeLog(trades);
   } catch (err) {
